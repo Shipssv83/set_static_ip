@@ -50,170 +50,142 @@ echo "
       11   iii   ttt         pp      rr   rr  oo     oo
       11   iii   ttt         pp      rr    rr  ooooooo
 "
+# Устанавливаем строгий режим выполнения скрипта для повышения надежности
+set -euo pipefail
 
-# Функция для вывода сообщений с форматированием
-fancy_echo() {
-  local fmt="$1"; shift
-  printf "\n$fmt\n" "$@"
+# Функция для вывода логов с временной меткой
+log() {
+  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $*"
 }
 
-# Запрос пароля администратора
-sudo -v
+# Функция для вывода ошибок и выхода из скрипта
+error_exit() {
+  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: ERROR: $*" >&2
+  exit 1
+}
 
-# Обработка ошибок
-trap 'ret=$?; test $ret -ne 0 && printf "failed\n\n" >&2; exit $ret' EXIT
+# Проверка, что скрипт выполняется от имени root
+if [[ "${EUID}" -ne 0 ]]; then
+  error_exit "Этот скрипт должен быть запущен от имени root."
+fi
 
-set -e
-
-# Проверка и добавление пользователя office-adm
-create_office_adm_user() {
-  if ! id -u office-adm > /dev/null 2>&1; then
-    fancy_echo "Creating user office-adm..."
-    read -s -p "Enter password for office-adm: " password
-    echo
-    sudo useradd -m -s /bin/bash office-adm
-    echo "office-adm:$password" | sudo chpasswd
-    sudo usermod -aG sudo office-adm
-  else
-    fancy_echo "User office-adm already exists. Skipping."
+# Проверка наличия необходимых команд
+required_commands=(ip netplan)
+for cmd in "${required_commands[@]}"; do
+  if ! command -v "$cmd" &>/dev/null; then
+    error_exit "Команда '$cmd' не найдена. Пожалуйста, установите её и повторите попытку."
   fi
+done
+
+# Функция для определения активного сетевого интерфейса
+get_default_interface() {
+  ip route | grep '^default' | awk '{print $5}' | head -n1
 }
 
-# Настройка sudo без пароля для пользователя $USER и office-adm
-configure_sudo() {
-  for user in $USER office-adm; do
-    if ! sudo grep -q "^$user ALL=(ALL:ALL) NOPASSWD: ALL$" /etc/sudoers.d/$user; then
-      fancy_echo "Configuring sudo for user $user..."
-      echo "$user ALL=(ALL:ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$user
-    else
-      fancy_echo "Sudo configuration for $user already exists. Skipping."
-    fi
-  done
-}
+# Чтение входных данных от пользователя или установка значений по умолчанию
+read -rp "Введите статический IP-адрес (например, 10.10.0.35/24): " STATIC_IP
+read -rp "Введите шлюз (gateway) (например, 10.10.0.1): " GATEWAY
+read -rp "Введите DNS-серверы через запятую (например, 8.8.8.8,10.10.0.251): " DNS_SERVERS
+read -rp "Введите имя сетевого интерфейса (оставьте пустым для автоматического определения): " INTERFACE
 
-# Установка необходимых пакетов
-install_packages() {
-  fancy_echo "Installing necessary packages..."
-  sudo apt-get update
-  sudo apt-get -y install vim python3 openssh-server ufw ansible \
-    gzip p7zip-rar cabextract unace rar expect openjdk-8-jdk ecryptfs-utils \
-    cryptsetup gimp google-chrome-stable vim python3-pip flameshot net-tools \
-    speedtest-cli gnome-tweaks pritunl-client-electron dconf-editor flatpak \
-    ubuntu-restricted-extras nautilus-admin exe-thumbnailer
-}
-
-# Установка пакетов из Snap
-install_snap_packages() {
-  fancy_echo "Installing snap packages..."
-  sudo snap install telegram-desktop eversticky standard-notes teams-for-linux \
-    postman bitwarden
-}
-
-# Настройка репозиториев
-configure_repositories() {
-  fancy_echo "Adding necessary repositories..."
-  # Добавление репозитория AnyDesk
-  echo "deb http://deb.anydesk.com/ all main" | sudo tee /etc/apt/sources.list.d/anydesk.list
-  wget -qO - https://keys.anydesk.com/repos/DEB-GPG-KEY | sudo apt-key add -
-
-  # Добавление репозитория Google Chrome
-  echo "deb [arch=amd64] https://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-  wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo tee /etc/apt/trusted.gpg.d/google.gpg
-
-  # Добавление Flathub в Flatpak
-  if [ ! -f /var/lib/flatpak/repo/flathub ]; then
-    flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+# Если интерфейс не указан, определить его автоматически
+if [[ -z "$INTERFACE" ]]; then
+  INTERFACE=$(get_default_interface)
+  if [[ -z "$INTERFACE" ]]; then
+    error_exit "Не удалось определить сетевой интерфейс. Пожалуйста, укажите его вручную."
   fi
-}
+  log "Автоматически определён сетевой интерфейс: $INTERFACE"
+else
+  log "Используется указанный сетевой интерфейс: $INTERFACE"
+fi
 
-# Установка AnyDesk
-install_anydesk() {
-  fancy_echo "Installing AnyDesk..."
-  sudo apt-get update
-  sudo apt-get -y install anydesk
-}
+# Валидация введённых данных
+# Проверка IP-адреса
+if ! [[ "$STATIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+  error_exit "Неверный формат статического IP-адреса. Пример правильного формата: 192.168.1.100/24"
+fi
 
-# Настройка SSH
-setup_ssh() {
-  local ssh_dir="/home/$USER/.ssh"
-  local authorized_keys="$ssh_dir/authorized_keys"
-  local ssh_keys="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA3vlPm27iD4PnRPb6G+mYhRlHR6HY+5x908fEk0O57V s.shipilov"
+# Проверка шлюза
+if ! [[ "$GATEWAY" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  error_exit "Неверный формат шлюза. Пример правильного формата: 192.168.1.1"
+fi
 
-  fancy_echo "Setting up SSH for user $USER..."
-
-  mkdir -p "$ssh_dir"
-  echo "$ssh_keys" > "$authorized_keys"
-
-  chmod 700 "$ssh_dir"
-  chown $USER:$USER "$ssh_dir"
-
-  chmod 600 "$authorized_keys"
-  chown $USER:$USER "$authorized_keys"
-
-  cat "$authorized_keys"
-}
-
-# Настройка конфигурации SSHD
-configure_sshd() {
-  fancy_echo "Configuring SSH daemon..."
-
-  sudo sed -i 's/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?PermitUserEnvironment.*/PermitUserEnvironment no/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?ClientAliveCountMax.*/ClientAliveCountMax 0/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?LogLevel.*/LogLevel VERBOSE/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 4/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?IgnoreRhosts.*/IgnoreRhosts yes/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?Protocol.*/Protocol 2/' /etc/ssh/sshd_config
-  sudo sed -i 's/^#\?Banner.*/Banner \/etc\/issue.net/' /etc/ssh/sshd_config
-}
-
-# Настройка UFW для порта SSH
-configure_ufw() {
-  local ssh_port=22  # Установите нужный порт SSH
-
-  if ! dpkg -l | grep -q ufw; then
-    fancy_echo "Installing UFW..."
-    sudo apt-get -y install ufw
+# Проверка DNS-серверов
+IFS=',' read -ra DNS_ARRAY <<< "$DNS_SERVERS"
+for dns in "${DNS_ARRAY[@]}"; do
+  if ! [[ "$dns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    error_exit "Неверный формат DNS-сервера: $dns. Пример правильного формата: 8.8.8.8"
   fi
+done
 
-  fancy_echo "Configuring UFW for SSH port $ssh_port..."
-  sudo ufw allow $ssh_port/tcp comment 'ssh port'
-}
+# Определение путей к конфигурационным файлам Netplan
+NETPLAN_DIR="/etc/netplan"
+NETPLAN_MAIN_FILE="${NETPLAN_DIR}/01-netcfg.yaml"
+NETPLAN_CLOUDINIT_FILE="${NETPLAN_DIR}/50-cloud-init.yaml"
 
-# Перезагрузка службы SSH
-restart_ssh_service() {
-  if grep -q '^DISTRIB_RELEASE=24.04' /etc/lsb-release; then
-    fancy_echo "Ubuntu 24.04 detected. Reloading systemd and restarting ssh..."
-    sudo systemctl daemon-reload
-    sudo systemctl restart ssh
-  else
-    fancy_echo "Other Ubuntu version detected. Restarting sshd..."
-    sudo systemctl restart sshd
-  fi
-}
+# Проверка существования директории Netplan
+if [[ ! -d "$NETPLAN_DIR" ]]; then
+  error_exit "Директория Netplan не найдена: $NETPLAN_DIR"
+fi
 
-# Вывод информации о сетевом интерфейсе
-print_network_info() {
-  fancy_echo "Network information:"
-  ip -o -4 addr show | awk '{print $2, $4}'  # Вывод IP-адресов и сетевых интерфейсов
-}
+# Обработка файла 50-cloud-init.yaml
+if [[ -f "$NETPLAN_CLOUDINIT_FILE" ]]; then
+  read -rp "Найден файл $NETPLAN_CLOUDINIT_FILE, который может конфликтовать с настройками. Хотите удалить его? (y/N): " CONFIRM
+  case "$CONFIRM" in
+    [yY][eE][sS]|[yY])
+      log "Удаление файла $NETPLAN_CLOUDINIT_FILE..."
+      rm -f "$NETPLAN_CLOUDINIT_FILE"
+      ;;
+    *)
+      log "Оставление файла $NETPLAN_CLOUDINIT_FILE неизменным."
+      ;;
+  esac
+fi
 
-# Основная логика
-install_packages
-install_snap_packages
-configure_repositories
-install_anydesk
-configure_sudo
-setup_ssh
-configure_sshd
-configure_ufw
-restart_ssh_service
-print_network_info
+# Резервное копирование существующего конфигурационного файла Netplan
+if [[ -f "$NETPLAN_MAIN_FILE" ]]; then
+  BACKUP_FILE="${NETPLAN_MAIN_FILE}.bak.$(date +%F_%T)"
+  log "Создание резервной копии существующего файла Netplan: $BACKUP_FILE"
+  cp "$NETPLAN_MAIN_FILE" "$BACKUP_FILE"
+else
+  log "Файл Netplan не найден. Будет создан новый файл: $NETPLAN_MAIN_FILE"
+fi
 
-fancy_echo "Done."
+# Генерация новой конфигурации Netplan
+log "Создание новой конфигурации Netplan..."
+
+cat <<EOF > "$NETPLAN_MAIN_FILE"
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $INTERFACE:
+      dhcp4: no
+      addresses:
+        - $STATIC_IP
+      gateway4: $GATEWAY
+      nameservers:
+        addresses: [$(echo $DNS_SERVERS | sed 's/,/, /g')]
+EOF
+
+# Применение новой конфигурации Netplan
+log "Применение новой конфигурации Netplan..."
+netplan apply || error_exit "Не удалось применить конфигурацию Netplan."
+
+log "Статический IP успешно настроен:"
+log "Интерфейс: $INTERFACE"
+log "IP-адрес: $STATIC_IP"
+log "Шлюз: $GATEWAY"
+log "DNS-серверы: $DNS_SERVERS"
+
+exit 0
+
+# Дополнительные команды для проверки настроек:
+# ip addr show $INTERFACE
+# ip route
+# systemd-resolve --status
+
+# Восстановление Резервной Копии (если потребуется):
+# sudo cp /etc/netplan/01-netcfg.yaml.bak.YYYY-MM-DD_HH:MM:SS /etc/netplan/01-netcfg.yaml
+# sudo netplan apply
 ```
